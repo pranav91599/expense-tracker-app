@@ -114,10 +114,10 @@ function App() {
                 title={serverOnline ? 'Connected to PostgreSQL REST API' : 'Cannot reach backend REST API'}
               >
                 <Database size={11} />
-                <span>PostgreSQL</span>
+                <span>Prisma • Supabase</span>
               </span>
             </div>
-            <p className="app-subtitle">Secure Full-Stack Financial Manager</p>
+            <p className="app-subtitle">Cloud-Synced Financial Manager</p>
           </div>
         </div>
 

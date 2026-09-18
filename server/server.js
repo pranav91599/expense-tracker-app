@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
-import { query, initDB } from './db.js';
+import { prisma, connectDB } from './db.js';
 import authRoutes from './routes/auth.js';
 import { authMiddleware } from './middleware/auth.js';
 
@@ -10,8 +10,8 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-// Initialize Database Schema on start
-initDB();
+// Connect to Database
+connectDB();
 
 // Middleware
 app.use(cors());
@@ -27,20 +27,17 @@ app.use((req, res, next) => {
   next();
 });
 
-// Helper for PostgreSQL date filtering
-const getDateCondition = (filter, startIndex = 2) => {
+// Helper for timeframe date calculation
+const getStartDateForFilter = (filter) => {
   const now = new Date();
   if (filter === 'daily') {
-    const startOfDay = new Date(now.getFullYear(), now.getMonth(), now.getDate()).toISOString();
-    return { condition: `date >= $${startIndex}`, params: [startOfDay] };
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate());
   } else if (filter === 'monthly') {
-    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1).toISOString();
-    return { condition: `date >= $${startIndex}`, params: [startOfMonth] };
+    return new Date(now.getFullYear(), now.getMonth(), 1);
   } else if (filter === 'yearly') {
-    const startOfYear = new Date(now.getFullYear(), 0, 1).toISOString();
-    return { condition: `date >= $${startIndex}`, params: [startOfYear] };
+    return new Date(now.getFullYear(), 0, 1);
   }
-  return { condition: '1=1', params: [] };
+  return null;
 };
 
 // 1. Health Check
@@ -48,8 +45,8 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     timestamp: new Date().toISOString(),
-    service: 'VaultFlow PostgreSQL & JWT REST API',
-    version: '2.0.0'
+    service: 'VaultFlow Prisma ORM & Supabase REST API',
+    version: '3.0.0',
   });
 });
 
@@ -60,57 +57,53 @@ app.use('/api/auth', authRoutes);
 // Protected Routes (User Authentication Required)
 // -------------------------------------------------------------
 
-// 3. GET /api/transactions - Query user's transactions
+// 3. GET /api/transactions - Query user's transactions with Prisma
 app.get('/api/transactions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { search, type, category, filter } = req.query;
 
-    let whereClauses = ['user_id = $1'];
-    let params = [userId];
-    let paramIndex = 2;
+    const where = {
+      userId,
+    };
 
     if (filter && filter !== 'all') {
-      const dateFilter = getDateCondition(filter, paramIndex);
-      if (dateFilter.params.length > 0) {
-        whereClauses.push(dateFilter.condition);
-        params.push(...dateFilter.params);
-        paramIndex += dateFilter.params.length;
+      const startDate = getStartDateForFilter(filter);
+      if (startDate) {
+        where.date = { gte: startDate };
       }
     }
 
     if (type && (type === 'income' || type === 'expense')) {
-      whereClauses.push(`type = $${paramIndex}`);
-      params.push(type);
-      paramIndex++;
+      where.type = type;
     }
 
     if (category) {
-      whereClauses.push(`category = $${paramIndex}`);
-      params.push(category);
-      paramIndex++;
+      where.category = category;
     }
 
     if (search) {
-      whereClauses.push(`(reason ILIKE $${paramIndex} OR category ILIKE $${paramIndex})`);
-      params.push(`%${search}%`);
-      paramIndex++;
+      where.OR = [
+        { reason: { contains: search, mode: 'insensitive' } },
+        { category: { contains: search, mode: 'insensitive' } },
+      ];
     }
 
-    const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
-    const sql = `SELECT * FROM transactions ${whereSql} ORDER BY date DESC, id DESC`;
+    const transactions = await prisma.transaction.findMany({
+      where,
+      orderBy: [{ date: 'desc' }, { id: 'desc' }],
+    });
 
-    const result = await query(sql, params);
-    // Parse numeric amounts for JSON response
-    const transactions = result.rows.map(row => ({
-      ...row,
-      amount: parseFloat(row.amount)
+    const parsedTransactions = transactions.map((t) => ({
+      ...t,
+      amount: Number(t.amount),
+      date: t.date.toISOString(),
     }));
 
-    res.json({ success: true, count: transactions.length, data: transactions });
+    res.json({ success: true, count: parsedTransactions.length, data: parsedTransactions });
   } catch (err) {
-    console.error('Error fetching transactions:', err);
-    res.status(500).json({ success: false, error: 'Failed to fetch transactions from PostgreSQL' });
+    console.error('Error fetching transactions with Prisma:', err);
+    res.status(500).json({ success: false, error: 'Failed to fetch transactions' });
   }
 });
 
@@ -118,24 +111,38 @@ app.get('/api/transactions', authMiddleware, async (req, res) => {
 app.get('/api/transactions/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const result = await query(
-      'SELECT * FROM transactions WHERE id = $1 AND user_id = $2',
-      [req.params.id, userId]
-    );
+    const txId = parseInt(req.params.id, 10);
 
-    if (result.rows.length === 0) {
+    if (isNaN(txId)) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction ID' });
+    }
+
+    const transaction = await prisma.transaction.findFirst({
+      where: {
+        id: txId,
+        userId,
+      },
+    });
+
+    if (!transaction) {
       return res.status(404).json({ success: false, error: 'Transaction not found or unauthorized' });
     }
 
-    const tx = { ...result.rows[0], amount: parseFloat(result.rows[0].amount) };
-    res.json({ success: true, data: tx });
+    res.json({
+      success: true,
+      data: {
+        ...transaction,
+        amount: Number(transaction.amount),
+        date: transaction.date.toISOString(),
+      },
+    });
   } catch (err) {
-    console.error('Error fetching transaction by ID:', err);
+    console.error('Error fetching transaction by ID with Prisma:', err);
     res.status(500).json({ success: false, error: 'Failed to fetch transaction' });
   }
 });
 
-// 5. POST /api/transactions - Create new transaction
+// 5. POST /api/transactions - Create new transaction with Prisma
 app.post('/api/transactions', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -154,95 +161,132 @@ app.post('/api/transactions', authMiddleware, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Reason/Description is required' });
     }
 
-    const txDate = date ? new Date(date).toISOString() : new Date().toISOString();
+    const txDate = date ? new Date(date) : new Date();
     const txCategory = category ? category.trim() : 'Other';
 
-    const insertResult = await query(
-      `INSERT INTO transactions (user_id, type, amount, reason, category, date) 
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
-      [userId, type, parsedAmount, reason.trim(), txCategory, txDate]
-    );
+    const newTx = await prisma.transaction.create({
+      data: {
+        userId,
+        type,
+        amount: parsedAmount,
+        reason: reason.trim(),
+        category: txCategory,
+        date: txDate,
+      },
+    });
 
-    const newTx = { ...insertResult.rows[0], amount: parseFloat(insertResult.rows[0].amount) };
-    res.status(201).json({ success: true, message: 'Transaction created successfully', data: newTx });
+    res.status(201).json({
+      success: true,
+      message: 'Transaction created successfully',
+      data: {
+        ...newTx,
+        amount: Number(newTx.amount),
+        date: newTx.date.toISOString(),
+      },
+    });
   } catch (err) {
-    console.error('Error creating transaction in PostgreSQL:', err);
+    console.error('Error creating transaction with Prisma:', err);
     res.status(500).json({ success: false, error: 'Failed to create transaction' });
   }
 });
 
-// 6. PUT /api/transactions/:id - Update transaction
+// 6. PUT /api/transactions/:id - Update transaction with Prisma
 app.put('/api/transactions/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { id } = req.params;
+    const txId = parseInt(req.params.id, 10);
 
-    const existingRes = await query('SELECT * FROM transactions WHERE id = $1 AND user_id = $2', [id, userId]);
-    if (existingRes.rows.length === 0) {
+    if (isNaN(txId)) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction ID' });
+    }
+
+    // Verify ownership
+    const existing = await prisma.transaction.findFirst({
+      where: { id: txId, userId },
+    });
+
+    if (!existing) {
       return res.status(404).json({ success: false, error: 'Transaction not found or unauthorized' });
     }
 
-    const existing = existingRes.rows[0];
     const { type, amount, reason, category, date } = req.body;
 
-    const updatedType = type || existing.type;
-    const updatedAmount = amount !== undefined ? parseFloat(amount) : parseFloat(existing.amount);
-    const updatedReason = reason !== undefined ? reason.trim() : existing.reason;
-    const updatedCategory = category !== undefined ? category.trim() : existing.category;
-    const updatedDate = date !== undefined ? new Date(date).toISOString() : existing.date;
+    const updatedTx = await prisma.transaction.update({
+      where: { id: txId },
+      data: {
+        ...(type ? { type } : {}),
+        ...(amount !== undefined ? { amount: parseFloat(amount) } : {}),
+        ...(reason !== undefined ? { reason: reason.trim() } : {}),
+        ...(category !== undefined ? { category: category.trim() } : {}),
+        ...(date !== undefined ? { date: new Date(date) } : {}),
+      },
+    });
 
-    const updateRes = await query(
-      `UPDATE transactions SET type = $1, amount = $2, reason = $3, category = $4, date = $5 
-       WHERE id = $6 AND user_id = $7 RETURNING *`,
-      [updatedType, updatedAmount, updatedReason, updatedCategory, updatedDate, id, userId]
-    );
-
-    const updatedTx = { ...updateRes.rows[0], amount: parseFloat(updateRes.rows[0].amount) };
-    res.json({ success: true, message: 'Transaction updated successfully', data: updatedTx });
+    res.json({
+      success: true,
+      message: 'Transaction updated successfully',
+      data: {
+        ...updatedTx,
+        amount: Number(updatedTx.amount),
+        date: updatedTx.date.toISOString(),
+      },
+    });
   } catch (err) {
-    console.error('Error updating transaction:', err);
+    console.error('Error updating transaction with Prisma:', err);
     res.status(500).json({ success: false, error: 'Failed to update transaction' });
   }
 });
 
-// 7. DELETE /api/transactions/:id - Delete transaction
+// 7. DELETE /api/transactions/:id - Delete transaction with Prisma
 app.delete('/api/transactions/:id', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
-    const { id } = req.params;
+    const txId = parseInt(req.params.id, 10);
 
-    const existingRes = await query('SELECT * FROM transactions WHERE id = $1 AND user_id = $2', [id, userId]);
-    if (existingRes.rows.length === 0) {
+    if (isNaN(txId)) {
+      return res.status(400).json({ success: false, error: 'Invalid transaction ID' });
+    }
+
+    const existing = await prisma.transaction.findFirst({
+      where: { id: txId, userId },
+    });
+
+    if (!existing) {
       return res.status(404).json({ success: false, error: 'Transaction not found or unauthorized' });
     }
 
-    await query('DELETE FROM transactions WHERE id = $1 AND user_id = $2', [id, userId]);
-    res.json({ success: true, message: 'Transaction deleted successfully', id: Number(id) });
+    await prisma.transaction.delete({
+      where: { id: txId },
+    });
+
+    res.json({ success: true, message: 'Transaction deleted successfully', id: txId });
   } catch (err) {
-    console.error('Error deleting transaction from PostgreSQL:', err);
+    console.error('Error deleting transaction with Prisma:', err);
     res.status(500).json({ success: false, error: 'Failed to delete transaction' });
   }
 });
 
-// 8. GET /api/stats - Aggregated user statistics
+// 8. GET /api/stats - Aggregated user statistics with Prisma
 app.get('/api/stats', authMiddleware, async (req, res) => {
   try {
     const userId = req.user.id;
     const { filter } = req.query;
 
-    let whereClauses = ['user_id = $1'];
-    let params = [userId];
+    const where = {
+      userId,
+    };
 
     if (filter && filter !== 'all') {
-      const dateFilter = getDateCondition(filter, 2);
-      if (dateFilter.params.length > 0) {
-        whereClauses.push(dateFilter.condition);
-        params.push(...dateFilter.params);
+      const startDate = getStartDateForFilter(filter);
+      if (startDate) {
+        where.date = { gte: startDate };
       }
     }
 
-    const whereSql = `WHERE ${whereClauses.join(' AND ')}`;
-    const result = await query(`SELECT * FROM transactions ${whereSql} ORDER BY date DESC`, params);
+    const transactions = await prisma.transaction.findMany({
+      where,
+      orderBy: { date: 'desc' },
+    });
 
     let totalIncome = 0;
     let totalExpense = 0;
@@ -250,27 +294,28 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
     let expenseCount = 0;
     const categoryMap = {};
 
-    result.rows.forEach(row => {
-      const amount = parseFloat(row.amount);
-      if (row.type === 'income') {
-        totalIncome += amount;
+    transactions.forEach((t) => {
+      const amt = Number(t.amount);
+      if (t.type === 'income') {
+        totalIncome += amt;
         incomeCount += 1;
-      } else if (row.type === 'expense') {
-        totalExpense += amount;
+      } else if (t.type === 'expense') {
+        totalExpense += amt;
         expenseCount += 1;
-        categoryMap[row.category] = (categoryMap[row.category] || 0) + amount;
+        categoryMap[t.category] = (categoryMap[t.category] || 0) + amt;
       }
     });
 
     const balance = totalIncome - totalExpense;
-    const savingsRate = totalIncome > 0 
-      ? Math.max(0, Math.round(((totalIncome - totalExpense) / totalIncome) * 100))
-      : 0;
+    const savingsRate =
+      totalIncome > 0 ? Math.max(0, Math.round(((totalIncome - totalExpense) / totalIncome) * 100)) : 0;
 
-    const categoryBreakdown = Object.keys(categoryMap).map(key => ({
-      name: key,
-      value: categoryMap[key]
-    })).sort((a, b) => b.value - a.value);
+    const categoryBreakdown = Object.keys(categoryMap)
+      .map((key) => ({
+        name: key,
+        value: categoryMap[key],
+      }))
+      .sort((a, b) => b.value - a.value);
 
     res.json({
       success: true,
@@ -282,12 +327,12 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
         savingsRate,
         incomeCount,
         expenseCount,
-        totalTransactions: result.rows.length,
-        categoryBreakdown
-      }
+        totalTransactions: transactions.length,
+        categoryBreakdown,
+      },
     });
   } catch (err) {
-    console.error('Error computing user stats:', err);
+    console.error('Error computing user stats with Prisma:', err);
     res.status(500).json({ success: false, error: 'Failed to compute stats' });
   }
 });
@@ -295,6 +340,6 @@ app.get('/api/stats', authMiddleware, async (req, res) => {
 // Start Server
 app.listen(PORT, () => {
   console.log(`🚀 VaultFlow Server running on port ${PORT}`);
-  console.log(`🔐 PostgreSQL & JWT Authentication Active`);
+  console.log(`⚡ Prisma ORM & Supabase Cloud PostgreSQL Active`);
   console.log(`📡 Health check available at: http://localhost:${PORT}/api/health`);
 });

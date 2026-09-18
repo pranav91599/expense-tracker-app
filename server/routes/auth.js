@@ -1,7 +1,7 @@
 import express from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
-import { query } from '../db.js';
+import { prisma } from '../db.js';
 import { authMiddleware } from '../middleware/auth.js';
 import dotenv from 'dotenv';
 
@@ -38,38 +38,43 @@ router.post('/register', async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Check if user already exists
-    const existingUser = await query('SELECT id FROM users WHERE LOWER(email) = $1', [normalizedEmail]);
-    if (existingUser.rows.length > 0) {
+    // Check if user already exists via Prisma
+    const existingUser = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (existingUser) {
       return res.status(409).json({ success: false, error: 'An account with this email already exists.' });
     }
 
     // Hash password with bcrypt
-    const saltRounds = 10;
-    const hashedPassword = await bcrypt.hash(password, saltRounds);
+    const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Insert user into PostgreSQL
-    const insertRes = await query(
-      `INSERT INTO users (name, email, password) VALUES ($1, $2, $3) RETURNING id, name, email, created_at`,
-      [name.trim(), normalizedEmail, hashedPassword]
-    );
+    // Create user with Prisma
+    const newUser = await prisma.user.create({
+      data: {
+        name: name.trim(),
+        email: normalizedEmail,
+        password: hashedPassword,
+      },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        createdAt: true,
+      },
+    });
 
-    const newUser = insertRes.rows[0];
     const token = generateToken(newUser);
 
     res.status(201).json({
       success: true,
       message: 'User registered successfully',
       token,
-      user: {
-        id: newUser.id,
-        name: newUser.name,
-        email: newUser.email,
-        createdAt: newUser.created_at
-      }
+      user: newUser,
     });
   } catch (err) {
-    console.error('Error in user registration:', err);
+    console.error('Error in Prisma user registration:', err);
     res.status(500).json({ success: false, error: 'Registration failed. Please try again.' });
   }
 });
@@ -85,13 +90,14 @@ router.post('/login', async (req, res) => {
 
     const normalizedEmail = email.trim().toLowerCase();
 
-    // Find user in PostgreSQL
-    const userRes = await query('SELECT * FROM users WHERE LOWER(email) = $1', [normalizedEmail]);
-    if (userRes.rows.length === 0) {
+    // Find user via Prisma
+    const user = await prisma.user.findUnique({
+      where: { email: normalizedEmail },
+    });
+
+    if (!user) {
       return res.status(401).json({ success: false, error: 'Invalid email or password.' });
     }
-
-    const user = userRes.rows[0];
 
     // Verify password with bcrypt
     const isPasswordValid = await bcrypt.compare(password, user.password);
@@ -109,11 +115,11 @@ router.post('/login', async (req, res) => {
         id: user.id,
         name: user.name,
         email: user.email,
-        createdAt: user.created_at
-      }
+        createdAt: user.createdAt,
+      },
     });
   } catch (err) {
-    console.error('Error in user login:', err);
+    console.error('Error in Prisma user login:', err);
     res.status(500).json({ success: false, error: 'Login failed. Please try again.' });
   }
 });
@@ -121,14 +127,23 @@ router.post('/login', async (req, res) => {
 // 3. GET /api/auth/me (Protected)
 router.get('/me', authMiddleware, async (req, res) => {
   try {
-    const userRes = await query('SELECT id, name, email, created_at FROM users WHERE id = $1', [req.user.id]);
-    if (userRes.rows.length === 0) {
+    const user = await prisma.user.findUnique({
+      where: { id: req.user.id },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        createdAt: true,
+      },
+    });
+
+    if (!user) {
       return res.status(404).json({ success: false, error: 'User not found.' });
     }
 
     res.json({
       success: true,
-      user: userRes.rows[0]
+      user,
     });
   } catch (err) {
     console.error('Error in get current user profile:', err);
